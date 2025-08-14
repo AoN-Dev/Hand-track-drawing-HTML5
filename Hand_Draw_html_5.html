@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HandDraw — Camera Hand-Tracking Canvas</title>
+  <style>
+    :root{
+      --bg:#0f1115; --panel:#171923; --muted:#8b90a0; --text:#e6e8ef; --accent:#7aa2f7; --ok:#67e8f9; --warn:#fbbf24; --danger:#fb7185;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;background:linear-gradient(180deg,#0b0e14,#0f1115 40%);color:var(--text);font:500 16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial}
+    .app{display:grid;grid-template-rows:auto 1fr auto;min-height:100vh}
+    .toolbar{display:flex;gap:.75rem;align-items:center;justify-content:center;flex-wrap:wrap;padding:.75rem 1rem;background:rgba(23,25,35,.8);backdrop-filter: blur(8px);border-bottom:1px solid rgba(255,255,255,.06);position:sticky;top:0;z-index:10}
+    .toolbar .group{display:flex;align-items:center;gap:.5rem;padding:.35rem .5rem;background:#11131a;border:1px solid rgba(255,255,255,.06);border-radius:14px}
+    label{font-size:.85rem;color:var(--muted)}
+    input[type="color"]{width:34px;height:28px;border:none;border-radius:8px;background:transparent;padding:0;overflow:hidden}
+    input[type="range"]{accent-color:var(--accent)}
+    button{appearance:none;border:none;padding:.55rem .8rem;border-radius:12px;background:#0f1220;color:var(--text);border:1px solid rgba(255,255,255,.08);cursor:pointer;transition:.2s transform,.2s background}
+    button:hover{transform:translateY(-1px);background:#15182a}
+    button.active{outline:2px solid var(--accent);background:#0f1426}
+    .main{position:relative;display:grid;place-items:center;padding:10px}
+    .stage{position:relative;width:min(100vw,900px);aspect-ratio:4/3;border-radius:20px;overflow:hidden;box-shadow:0 10px 40px rgba(0,0,0,.4);border:1px solid rgba(255,255,255,.06)}
+    video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);filter:saturate(1.1) contrast(1.05) brightness(.95)}
+    canvas{position:absolute;inset:0;width:100%;height:100%}
+    #landmarks{pointer-events:none}
+    .legend{position:absolute;right:10px;bottom:10px;background:rgba(15,17,26,.75);border:1px solid rgba(255,255,255,.06);padding:.6rem .7rem;border-radius:12px;font-size:.85rem;color:var(--muted)}
+    .legend b{color:var(--text)}
+    .footer{padding:.6rem 1rem;color:var(--muted);display:flex;justify-content:center;gap:1rem;flex-wrap:wrap}
+    .badge{display:inline-flex;align-items:center;gap:.4rem;background:#11131a;border:1px solid rgba(255,255,255,.06);padding:.3rem .55rem;border-radius:10px}
+    .dot{width:8px;height:8px;border-radius:50%}
+    .dot.ok{background:var(--ok)}
+    .dot.warn{background:var(--warn)}
+    .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+  </style>
+  <!-- MediaPipe Hands classic APIs -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+</head>
+<body>
+<div class="app">
+  <header class="toolbar" role="toolbar" aria-label="Drawing controls">
+    <div class="group" title="Brush color">
+      <label for="color">Color</label>
+      <input id="color" type="color" value="#7aa2f7" />
+    </div>
+    <div class="group" title="Brush size">
+      <label for="size">Size</label>
+      <input id="size" type="range" min="1" max="40" step="1" value="6" />
+    </div>
+    <div class="group" title="Tool">
+      <button id="tool-draw" class="active" aria-pressed="true">✏️ Draw</button>
+      <button id="tool-erase" aria-pressed="false">🧽 Erase</button>
+    </div>
+    <div class="group">
+      <button id="undo" title="Undo (U)">↶ Undo</button>
+      <button id="clear" title="Clear (C)">🗑️ Clear</button>
+      <button id="save" title="Save PNG (S)">💾 Save</button>
+    </div>
+    <div class="group" title="Camera">
+      <button id="toggle-cam">🎥 On</button>
+      <span id="fps" aria-live="polite" class="badge">FPS: --</span>
+    </div>
+  </header>
+
+  <main class="main">
+    <div class="stage" aria-live="polite">
+      <video id="video" playsinline class="mirror" muted></video>
+      <canvas id="landmarks"></canvas>
+      <canvas id="paint"></canvas>
+      <div class="legend">
+        <b>Gestures</b><br/>
+        • Pinch <b>Thumb–Index</b>: draw with current tool.<br/>
+        • Pinch <b>Thumb–Middle</b>: temporarily switch to Eraser.<br/>
+        • Release fingers: stop drawing.
+      </div>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <span class="badge"><span class="dot ok"></span>Camera</span>
+    <span class="badge" id="hand-state">Hands: 0</span>
+    <span class="badge">Keys: [U]ndo · [C]lear · [S]ave · [E]rase</span>
+  </footer>
+</div>
+
+<script>
+(function(){
+  const video = document.getElementById('video');
+  const lmCanvas = document.getElementById('landmarks');
+  const drawCanvas = document.getElementById('paint');
+  const fpsEl = document.getElementById('fps');
+  const handStateEl = document.getElementById('hand-state');
+  const colorEl = document.getElementById('color');
+  const sizeEl = document.getElementById('size');
+  const undoBtn = document.getElementById('undo');
+  const clearBtn = document.getElementById('clear');
+  const saveBtn = document.getElementById('save');
+  const camBtn = document.getElementById('toggle-cam');
+  const toolDraw = document.getElementById('tool-draw');
+  const toolErase = document.getElementById('tool-erase');
+
+  const lmCtx = lmCanvas.getContext('2d');
+  const drawCtx = drawCanvas.getContext('2d');
+  let activeTool = 'draw';
+
+  // Path stack for undo/redo-less simplicity
+  const paths = []; // {points:[{x,y}], size, color, mode}
+  let currentPath = null;
+
+  // UI helpers
+  function setTool(t){
+    activeTool = t;
+    toolDraw.classList.toggle('active', t==='draw'); toolDraw.setAttribute('aria-pressed', t==='draw');
+    toolErase.classList.toggle('active', t==='erase'); toolErase.setAttribute('aria-pressed', t==='erase');
+  }
+  toolDraw.onclick=()=>setTool('draw');
+  toolErase.onclick=()=>setTool('erase');
+
+  undoBtn.onclick=()=>{ paths.pop(); redrawAll(); };
+  clearBtn.onclick=()=>{ paths.length=0; redrawAll(); };
+  saveBtn.onclick=()=>{
+    // Composite video + painting? Only painting for now
+    const link = document.createElement('a');
+    link.download = `handdraw-${Date.now()}.png`;
+    link.href = drawCanvas.toDataURL('image/png');
+    link.click();
+  };
+
+  document.addEventListener('keydown', (e)=>{
+    if(e.key==='u' || e.key==='U') undoBtn.click();
+    if(e.key==='c' || e.key==='C') clearBtn.click();
+    if(e.key==='s' || e.key==='S') saveBtn.click();
+    if(e.key==='e' || e.key==='E') setTool(activeTool==='draw'?'erase':'draw');
+  });
+
+  function fitCanvases(){
+    const rect = video.getBoundingClientRect();
+    [lmCanvas, drawCanvas].forEach(c=>{ c.width = rect.width * devicePixelRatio; c.height = rect.height * devicePixelRatio; c.style.width=rect.width+'px'; c.style.height=rect.height+'px'; });
+    lmCtx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+    drawCtx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+    redrawAll();
+  }
+  window.addEventListener('resize', fitCanvases);
+
+  function redrawAll(){
+    drawCtx.clearRect(0,0,drawCanvas.width,drawCanvas.height);
+    for(const p of paths){
+      drawCtx.save();
+      drawCtx.lineJoin = drawCtx.lineCap = 'round';
+      drawCtx.lineWidth = p.size;
+      if(p.mode==='erase'){
+        drawCtx.globalCompositeOperation = 'destination-out';
+        drawCtx.strokeStyle = 'rgba(0,0,0,1)';
+      } else {
+        drawCtx.globalCompositeOperation = 'source-over';
+        drawCtx.strokeStyle = p.color;
+      }
+      drawCtx.beginPath();
+      for(let i=0;i<p.points.length;i++){
+        const pt = p.points[i];
+        if(i===0) drawCtx.moveTo(pt.x, pt.y); else drawCtx.lineTo(pt.x, pt.y);
+      }
+      drawCtx.stroke();
+      drawCtx.restore();
+    }
+  }
+
+  // --- Hand detection via MediaPipe Hands ---
+  let camera = null; let hands = null; let running = true;
+  camBtn.onclick = ()=>{ running = !running; camBtn.textContent = running? '🎥 On' : '🎥 Off'; if(running) startCamera(); else stopCamera(); };
+
+  function startCamera(){
+    if(camera) return; // already running
+    camera = new Camera(video, { onFrame: async ()=>{ await hands.send({image: video}); }, width: 960, height: 720 });
+    camera.start();
+  }
+  function stopCamera(){ if(camera){ camera.stop(); camera=null; } }
+
+  function setupHands(){
+    hands = new Hands({ locateFile: (file)=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6});
+    hands.onResults(onResults);
+  }
+
+  // Pinch detection helpers
+  function dist(a,b){ const dx=a.x-b.x, dy=a.y-b.y; return Math.hypot(dx,dy); }
+  let lastTime = performance.now(); let frames=0;
+
+  function onResults(results){
+    frames++; const now = performance.now(); if(now-lastTime>=1000){ fpsEl.textContent = `FPS: ${frames}`; frames=0; lastTime=now; }
+
+    // Resize overlay when video metadata available
+    if(lmCanvas.width===0) fitCanvases();
+
+    lmCtx.clearRect(0,0,lmCanvas.width,lmCanvas.height);
+
+    if(results.multiHandLandmarks && results.multiHandLandmarks.length){
+      handStateEl.textContent = `Hands: ${results.multiHandLandmarks.length}`;
+      const lm = results.multiHandLandmarks[0];
+      // Draw landmarks overlay
+      drawConnectors(lmCtx, lm, HAND_CONNECTIONS, {color:'#4ade80', lineWidth:2});
+      drawLandmarks(lmCtx, lm, {color:'#93c5fd', lineWidth:1, radius:2});
+
+      // Get normalized fingertip positions
+      const idx = lm[8]; // index tip
+      const thumb = lm[4];
+      const mid = lm[12];
+
+      // Gesture logic
+      const pinchIdx = dist(idx, thumb);
+      const pinchMid = dist(mid, thumb);
+
+      // Normalize thresholds w.r.t. hand size (distance wrist[0] to middle knuckle[9])
+      const base = dist(lm[0], lm[9]) || 0.1;
+      const isPinchDraw = pinchIdx < base * 0.5; // thumb-index pinch
+      const isPinchErase = pinchMid < base * 0.5; // thumb-middle pinch
+
+      const stageRect = lmCanvas.getBoundingClientRect();
+      const x = (1-idx.x) * stageRect.width; // mirror
+      const y = idx.y * stageRect.height;
+
+      const mode = isPinchErase ? 'erase' : activeTool; // thumb-middle pinch temporarily erases
+      const drawing = isPinchDraw || isPinchErase;
+
+      if(drawing){
+        const size = parseInt(sizeEl.value,10);
+        const color = colorEl.value;
+        const pt = { x, y };
+        if(!currentPath || currentPath.mode!==mode){
+          // start new path when switching mode or not drawing previously
+          currentPath = { points:[pt], size, color, mode };
+          paths.push(currentPath);
+        } else {
+          const last = currentPath.points[currentPath.points.length-1];
+          // simple smoothing
+          const lerp = (a,b,t)=>({x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t});
+          const steps = Math.ceil(dist(last, pt)/2);
+          for(let i=1;i<=steps;i++) currentPath.points.push( lerp(last, pt, i/steps) );
+        }
+        redrawAll();
+      } else {
+        currentPath = null;
+      }
+
+    } else {
+      handStateEl.textContent = 'Hands: 0';
+      currentPath = null;
+    }
+  }
+
+  // Boot
+  setupHands();
+  startCamera();
+
+  // Ensure canvases fit once video size known
+  video.addEventListener('loadedmetadata', fitCanvases);
+})();
+</script>
+</body>
+</html>
